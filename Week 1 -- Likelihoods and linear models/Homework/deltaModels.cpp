@@ -21,11 +21,14 @@ Type dinvgauss(Type x, Type mean, Type shape, int give_log=0){
 template<class Type>
 Type objective_function<Type>::operator() ()
 {
-  // All variables decalred should match up what's in R
-  // Indicate whether we want lognorm or gamma likelihood
+  // Integers give settings
+  // Options_vec: Whether lognormal, gamma, invgauss
+  // k: Which fold to test on
   DATA_IVECTOR( Options_vec );
+  DATA_IVECTOR( k );
   
-  // Y data and X data
+  // Fold indicator, response and design matrix
+  DATA_VECTOR( k_i );
   DATA_VECTOR( y_i );
   DATA_MATRIX( X_ij );
   
@@ -34,12 +37,15 @@ Type objective_function<Type>::operator() ()
   //  theta[0] = P(Y=0), theta[1] = sd of Y, Y>0
   PARAMETER_VECTOR( theta_z );
   
-  // Logistic model for Y=0
+  // Logistic model for Y=0, Lognormal model for Y>0, SD of log(Y)
   Type zero_prob = 1 / (1 + exp(-theta_z(0)));
-  // Lognormal model for Y>0, SD of log(Y)
   Type logsd = theta_z(1);
+  
   // Initialize cost: joint negative log likelihood
   Type jnll = 0;
+  Type train_jnll = 0;
+  Type test_jnll = 0;
+  
   // Number of observations, N
   int n_data = y_i.size();
   
@@ -47,16 +53,19 @@ Type objective_function<Type>::operator() ()
   vector<Type> linpred_i( n_data );
   linpred_i = X_ij * b_j;
   
-  // Probability of data conditional on fixed effect values
-  // For each observation 'i'
+  // Loop through each data point to calculate additive contribution to JNLL
   for( int i=0; i<n_data; i++){
-    // If the data Y=0, use log likelihood for Y=0 Bernoulli, log(p)
     if(y_i(i)==0){
-      jnll -= log( zero_prob );
+      jnll = log( zero_prob );
     } else{
-      if( Options_vec(0)==0 ) jnll -= log( 1-zero_prob ) + dlognorm( y_i(i), linpred_i(i), logsd, true );
-      if( Options_vec(0)==1 ) jnll -= log( 1-zero_prob ) + dgamma( y_i(i), 1/pow(logsd,2), exp(linpred_i(i))*pow(logsd,2), true );
-      if( Options_vec(0)==2 ) jnll -= log( 1-zero_prob ) + dinvgauss( y_i(i), exp(linpred_i(i)), logsd, true );
+      if( Options_vec(0)==0 ) jnll = log( 1-zero_prob ) + dlognorm( y_i(i), linpred_i(i), logsd, true );
+      if( Options_vec(0)==1 ) jnll = log( 1-zero_prob ) + dgamma( y_i(i), 1/pow(logsd,2), exp(linpred_i(i))*pow(logsd,2), true );
+      if( Options_vec(0)==2 ) jnll = log( 1-zero_prob ) + dinvgauss( y_i(i), exp(linpred_i(i)), logsd, true );
+    }
+    if(k_i(i)==k(0)){
+      test_jnll -= jnll;
+    } else{
+      train_jnll -= jnll;
     }
   }
   
@@ -65,6 +74,9 @@ Type objective_function<Type>::operator() ()
   REPORT( logsd );
   REPORT( linpred_i );
   ADREPORT( zero_prob );
+  ADREPORT( logsd );
+  REPORT( test_jnll );
+  REPORT( train_jnll );
   
-  return jnll;
+  return train_jnll;
 }

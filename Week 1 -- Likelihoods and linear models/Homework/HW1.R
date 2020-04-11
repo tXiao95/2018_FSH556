@@ -62,13 +62,13 @@ ggplot(logEBS, aes(year, med)) +
 
 # Model Fitting -----------------------------------------------------------
  # Compile code
-compile( "deltaLogNormal.cpp" )
+compile( "deltaModels.cpp" )
 catch <- EBS$catch
 lat <- EBS$catch
 X = cbind( "Intercept"=rep(1,length(catch)))
 
 # Step 2 -- build inputs and object
-dyn.load( dynlib("deltaLogNormal") )
+dyn.load( dynlib("deltaModels") )
 Params = list("b_j"=rep(1,ncol(X)), "theta_z"=c(1,1))
 Data = list( "y_i"=catch, "X_ij"=X, "Options_vec"=c(0))
 Obj = MakeADFun( data=Data, parameters=Params, DLL="deltaLogNormal")
@@ -82,15 +82,6 @@ Opt$diagnostics = data.frame( "name"=names(Obj$par),
                               "final_gradient"=as.vector(Obj$gr(Opt$par)))
 Opt$par # estimated parameters
 SD = sdreport( Obj ) # standard errors
-
-### Check convergence
-# Are the gradients close to zero
-all(abs(Opt$diagnostics[,'final_gradient'])<0.001)
-# How much did we reduce the gradient from the start by a factor of?
-norm(initial_grad, "2") / norm(Opt$diagnostics$final_gradient, "2")
-# Pretty large, so even though we don't have exactly 0 gradients, we've come
-# Is the hessian positive definite?
-(SD$pdHess==TRUE)
 
 # Compare estimates to data for Lognormal -----------------------------------------------
 
@@ -106,3 +97,48 @@ logsd <- sd(log(catch[catch > 0]))
 sprintf("SD of log catch from data %f", logsd)
 sprintf("SD of log catch from model %f", exp(Opt$par[3]))
 
+# Cross validation --------------------------------------------------------
+nFolds <- 10
+EBS[, k := sample(1:nFolds, size=.N, replace = TRUE)]
+TMBfile <- "deltaModels"
+
+compile( sprintf("%s.cpp", TMBfile) )
+dyn.load( dynlib(TMBfile) )
+catch <- EBS$catch
+lat   <- EBS$catch
+
+Data = list( "y_i"=catch, "X_ij"=X, "k_i"=EBS$k )
+X = cbind( "Intercept"=rep(1,length(catch)))
+Params = list("b_j"=rep(1,ncol(X)), "theta_z"=c(1,1))
+
+loss <- data.table::CJ(k = 1:nFolds,
+                   opt = 0:2,
+                   train_loss = 0, 
+                   test_loss = 0 )
+
+# For each likelihood, do 10-fold CV
+for (option in 0:2){
+  for(fold in 1:nFolds){
+    sprintf("Option %d, fold %d", option, fold)
+    Data$Options_vec <- option
+    Data$k <- fold
+    
+    nTest <- nrow(EBS[k == fold])
+    nTrain <- nrow(EBS[k != fold])
+    
+    Obj = MakeADFun( data=Data, parameters=Params, DLL="deltaLogNormal")
+    # initial_loss <- Obj$fn( Obj$par )
+    # initial_grad <- Obj$gr( Obj$par )
+    Opt = nlminb( start=Obj$par, objective=Obj$fn, gradient=Obj$gr )
+    Opt$diagnostics = data.frame( "name"=names(Obj$par), 
+                                  "Est"=Opt$par, 
+                                  "final_gradient"=as.vector(Obj$gr(Opt$par)))
+    # Opt$par # estimated parameters
+    SD = sdreport( Obj ) # standard errors
+    loss[k == fold & opt == option, `:=`(train_loss = Obj$report()$train_jnll / nTrain, 
+                                   test_loss = Obj$report()$test_jnll / nTest)]
+  }
+}
+
+loss[, mean(test_loss), by = opt]
+# Seems like the delta-lognormal model has the lowest out of sample error
