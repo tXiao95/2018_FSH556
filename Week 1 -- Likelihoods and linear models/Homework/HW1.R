@@ -1,6 +1,7 @@
 library(data.table)
 library(ggplot2)
 library(here)
+library(statmod)
 library(TMB)
 library(VAST)
 
@@ -66,12 +67,13 @@ compile( "deltaModels.cpp" )
 catch <- EBS$catch
 lat <- EBS$catch
 X = cbind( "Intercept"=rep(1,length(catch)))
+k_i = rep(1, length(catch))
 
 # Step 2 -- build inputs and object
 dyn.load( dynlib("deltaModels") )
 Params = list("b_j"=rep(1,ncol(X)), "theta_z"=c(1,1))
-Data = list( "y_i"=catch, "X_ij"=X, "Options_vec"=c(0))
-Obj = MakeADFun( data=Data, parameters=Params, DLL="deltaLogNormal")
+Data = list( "y_i"=catch, "X_ij"=X, "Options_vec"=c(0), "k_i"=k_i, k=c(2))
+Obj = MakeADFun( data=Data, parameters=Params, DLL="deltaModels")
 
 # Step 3 -- test and optimize
 initial_loss <- Obj$fn( Obj$par )
@@ -95,7 +97,7 @@ sprintf("Median of catch from data %f", exp(logmean))
 sprintf("Exp(mu) of catch from model %f", exp(Opt$par[1]))
 logsd <- sd(log(catch[catch > 0]))
 sprintf("SD of log catch from data %f", logsd)
-sprintf("SD of log catch from model %f", exp(Opt$par[3]))
+sprintf("SD of log catch from model %f", (Opt$par[3]))
 
 # Cross validation --------------------------------------------------------
 nFolds <- 10
@@ -126,7 +128,7 @@ for (option in 0:2){
     nTest <- nrow(EBS[k == fold])
     nTrain <- nrow(EBS[k != fold])
     
-    Obj = MakeADFun( data=Data, parameters=Params, DLL="deltaLogNormal")
+    Obj = MakeADFun( data=Data, parameters=Params, DLL="deltaModels")
     # initial_loss <- Obj$fn( Obj$par )
     # initial_grad <- Obj$gr( Obj$par )
     Opt = nlminb( start=Obj$par, objective=Obj$fn, gradient=Obj$gr )
@@ -139,6 +141,136 @@ for (option in 0:2){
                                    test_loss = Obj$report()$test_jnll / nTest)]
   }
 }
+# negative log likelihood
+Obj$fn( Opt$par )
+# Gradient at the last iteration
+Obj$gr( Opt$par )
+# Log preditive score per datum
+
 
 loss[, mean(test_loss), by = opt]
 # Seems like the delta-lognormal model has the lowest out of sample error
+
+# Simulation --------------------------------------------------------------
+
+#' The following experiment is as follows. We generate some simulated data based on 
+#' three different probability distributions. They are
+#' 
+#' 1) Lognormal
+#' 2) Gamma
+#' 3) Inverse gaussian
+#' 
+#' Then we estimate the parameters of interest using three different estimators. These are the
+#' three different models we estimated above. We perform a 3 x 3 analysis to estimate
+#' paramters under each unique scenario. 
+#' 
+#' 
+
+# Simulate data. For the distributions we simulate data from, we fix the parameters
+#' at what the models estimated from the entire dataset. 
+EBS$k <- -999
+X = cbind( "Intercept"=rep(1,length(EBS$catch)))
+# I have data arguments for K_i (the fold the row is in) and k (the fold I'm testing on). 
+#' Since I just want to train on everything, then just pick random values so that don't overlap
+Data = list( "y_i"=EBS$catch, "X_ij"=X, "k_i"=EBS$k, "k" = 999)
+Params = list("b_j"=rep(1,ncol(X)), "theta_z"=c(1,1))
+
+TMBfile <- "deltaModels"
+dyn.load( dynlib(TMBfile) )
+
+n <- nrow(EBS)
+nsim <- 100
+
+data <- CJ(sim=1:nsim, simM = 0:2, modelM = 0:2)
+
+# Hopefully these work like numpy?
+truth <- array(0, c(3, 3))
+simData <- array(0, c(3, 100, 3, 3))
+# 3 sim models, 100 replications, 3 estimation methods, 3 parameters each
+
+for(simModel in 1:3){
+  # Estimate a model on the whole dataset using 
+  # 1: lognormal, 2: gamma, 3: inverse gaussian
+  Data = list( "y_i"=EBS$catch, "X_ij"=X, "k_i"=EBS$k, "k" = 999, "Options_vec"=c(simModel-1))
+  Params = list("b_j"=rep(1,ncol(X)), "theta_z"=c(1,1))
+  ObjTruth = MakeADFun( data=Data, parameters=Params, DLL="deltaModels")
+  OptTruth = nlminb( start=ObjTruth$par, objective=ObjTruth$fn, gradient=ObjTruth$gr )
+  truth[simModel,] <- OptTruth$par
+
+  #' nsim iterations to get a distribution around parameters
+  for(i in 1:nsim){
+    p0 <- exp(OptTruth$par[2])
+    if(simModel == 1){
+      # Lognormal
+      logmean <- OptTruth$par[1]
+      logsd <- OptTruth$par[3]
+      simY <- rbinom(n, 1, 1-p0) * rlnorm(n, logmean, logsd)
+    } else if(simModel == 2){
+      # Gamma
+      xb <- OptTruth$par[1]
+      k <- 1 / OptTruth$par[3]^2
+      theta <- exp(xb) / k
+      simY <- rbinom(n, 1, 1-p0) * rgamma(n, shape=k, scale=theta)
+    } else if(simModel == 3){
+      # Inverse Gaussian
+      mean <- OptTruth$par[1]
+      shape <- OptTruth$par[3]
+      simY <- rbinom(n, 1, 1-p0) * rinvgauss(n, exp(mean), shape)
+    }
+    for(modelNum in 1:3){
+      #' Use each estimation strategy on each data generating process
+      Data = list( "y_i"=simY, "X_ij"=X, "k_i"=EBS$k, "k" = 999, "Options_vec" = modelNum-1)
+      Params = list("b_j"=rep(1,ncol(X)), "theta_z"=c(1,1))
+      ObjSim = MakeADFun( data=Data, parameters=Params, DLL="deltaModels")
+      OptSim = nlminb( start=ObjSim$par, objective=ObjSim$fn, gradient=ObjSim$gr )
+      
+      #' Store parameter estimates in array
+      simData[simModel, i, modelNum, ] <- OptSim$par
+    }
+  }
+}
+
+# Collapse to mean information
+simMeans <- apply(simData, c(1, 3, 4), mean)
+
+# Plotting simulation results ---------------------------------------------
+
+# Lognormal Simulation results
+simMeans[1,1,]
+truth[1,]
+
+# Gamma simulation results
+simMeans[2,2,]
+truth[2,]
+
+# Invgauss simulation resutls
+simMeans[3,3,]
+truth[3,]
+
+#' Plots
+#' For each simulation model
+#' 
+#' Facet by (Estimat x parameter). Overlaid with the truth for each one
+
+key <- CJ(modelNum=1:3, paramNum=1:3)
+key[, modelName := ifelse(modelNum == 1, "LN", 
+                          ifelse(modelNum == 2, "Gamma", "IG"))]
+key$param <- c("E(log(Y))", "p0", "SE(log(Y))", 
+               "log(E(Y))", "p0", "CV", 
+               "log(E(Y))", "p0", "shape")
+
+pdf(file="simulations.pdf", width=11, height=8.5)
+for(simNum in 1:3){
+  simModelName <- key[modelNum == simNum, unique(modelName)]
+  par(mfrow=c(3, 3))
+  for(estNum in 1:3){
+    for(parameter in 1:3){
+      keysub <- key[modelNum == estNum & paramNum == parameter]
+      data <- simData[simNum,,estNum,parameter]
+      hist(data, main=sprintf("%s Est for %s", keysub[,modelName], keysub[,param]))
+      abline(v=truth[estNum, parameter], col="red", lwd=3, lty=2)
+    }
+  }
+  mtext(sprintf("%s Simulated", simModelName), line = -1.4, outer = TRUE)
+}
+dev.off()
