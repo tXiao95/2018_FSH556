@@ -47,6 +47,8 @@ Type objective_function<Type>::operator() ()
   
   REPORT( sigma_y );
   REPORT( sigma_s );
+  REPORT( eps_s );
+  REPORT( delta_i );
   REPORT( mu );
   
   ADREPORT( sigma_y );

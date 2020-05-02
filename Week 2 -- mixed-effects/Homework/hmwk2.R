@@ -4,12 +4,10 @@ library(ggplot2)
 library(lme4)
 library(broom)
 
+# Empirical Bayes random effect estimation
+
 set.seed(1)
 # Set up data -------------------------------------------------------------
-n <- 1000
-n_s <- 10
-mu <- 2
-
 sim_data <- function(n, n_s, mu, sigma_s, sigma_y){
   # Group level effect
   eps_s <- rnorm(n_s, 0, sigma_s)
@@ -24,83 +22,98 @@ sim_data <- function(n, n_s, mu, sigma_s, sigma_y){
   data.table(y_i=y_i, group=group)
 }
 
-df <- sim_data(1000, 10, 2, 1, sqrt(.5))
-
-ggplot(df, aes(as.factor(group), y_i)) + geom_boxplot()
-
 # GLM: no variability -----------------------------------------------------
 fit1 <- glm(y_i ~ 1, data=df, family = "poisson")
 
 # GLM: Among-site variability ---------------------------------------------
-fit2 <- glmer(y_i ~ (1 | as.factor(group)), data=df, family="poisson")
+fit2 <- glmer(y_i ~ (1 | group), data=df, family="poisson")
 
-# TMB: just overdispersion ------------------------------------------------
-file_no_shift <- "GLMM_no_shift"
-compile(paste0(file_no_shift, ".cpp"))
-
-Data <- list("n"=nrow(df), 
-             "y_i"=df$y_i)
-
-Parameters <- list( "log_sigma_y"=0,
-                    "mu"=0,
-                    "delta_i"=rep(0, Data$n))
-Random <- c("delta_i")
-
-dyn.load( dynlib(file_no_shift) )
-Obj_no_shift <- MakeADFun(Data, Parameters, random = Random)
-Opt_no_shift <- TMBhelper::fit_tmb(Obj_no_shift)
-
-# Fit TMB Model: overdispersion and among-site -----------------------------------------------------------
+# TMB Models: overdispersion and among-site -----------------------------------------------------------
 file <- "GLMM"
-compile(paste0(file, ".cpp"))
-
-# Build inputs: Need size of arrays, and the design matrix itself
-Data <- list("n"=nrow(df), 
-             "n_s"=length(unique(df$group)), 
-             "y_i"=df$y_i, 
-             "s_i"=df$group-1)
-
-#' Parameters to estimate: 
-#' Random: 1000 overdispersion terms, 10 group terms
-#' Fixed: 1 sigma_s, 1 sigma_y
-Parameters = list( "log_sigma_s"=0, 
-                   "log_sigma_y"=0, 
-                   "mu"=0,
-                   "delta_i"=rep(0, Data$n), 
-                   "eps_s"=rep(0, Data$n_s))
+dyn.load( dynlib(file) )
+nSim <- 100
 
 # Indicate random effects (overdispersion and mean shift)
-Random = c("delta_i", "eps_s")
+Random <- c("delta_i", "eps_s")
 
-# Load .cpp template
-dyn.load( dynlib(file) )
+model <- 1:4
 
-# Create TMB object
-Obj <- MakeADFun(data=Data, parameters=Parameters, random=Random)
+est <- CJ(model=1:4, nSim=1:100, mu=0, se=0)
 
-# Minimize
-nlOpt <- nlminb(Obj$par, Obj$fn, Obj$gr)
-Opt <- TMBhelper::fit_tmb(Obj)
-
+for(i in 1:nSim){
+  # Build inputs: Need size of arrays, and the design matrix itself
+  df <- sim_data(1000, 10, 2, 1, sqrt(.5))
+  Data <- list("n"=nrow(df), 
+               "n_s"=length(unique(df$group)), 
+               "y_i"=df$y_i, 
+               "s_i"=df$group-1)
+  
+  #' Random: 1000 overdispersion terms, 10 group terms
+  #' Fixed: 1 sigma_s, 1 sigma_y
+  Parameters <- list( "log_sigma_s"=0, 
+                      "log_sigma_y"=0, 
+                      "mu"=0,
+                      "delta_i"=rep(0, Data$n), 
+                      "eps_s"=rep(0, Data$n_s))
+  
+  if(i %% 10 == 0) print(paste0("Sim ", i))
+  for (m in model){
+    Map <- list()
+    #' Turn off overdispersion
+    if(m %in% c(1,2)){
+      Map[["log_sigma_y"]] <- factor(NA)
+      Map[["delta_i"]] <- factor(rep(NA, Data$n))
+    }
+    
+    #' Turn off site specific effect
+    if(m %in% c(1,3)){
+      Map[["log_sigma_s"]] <- factor(NA)
+      Map[["eps_s"]] <- factor(rep(NA, Data$n_s))
+    }
+    Random_temp <- setdiff(Random, names(Map))
+    Obj <- MakeADFun(data=Data, parameters=Parameters, random=Random_temp, map=Map)
+    # Turn off pritning of mgc (max gradient component)
+    Obj$env$beSilent()
+    Opt <- TMBhelper::fit_tmb(Obj)
+    
+    #' Matrix of the estimate and SE of each parameter estimate (random and fixed effects). 
+    #' rownames are the parameters
+    sd_matrix <- summary(sdreport(Obj))
+    
+    # Save estimate and SE
+    est[model == m & nSim == i, `:=`(mu = sd_matrix['mu',1], 
+                                     se = sd_matrix['mu', 2])]
+  }
+}
 
 # Create mu table ---------------------------------------------------------
+est[, model := ifelse(model == 1, "Global", 
+                      ifelse(model == 2, "SiteEffect", 
+                             ifelse(model == 3, "Overdispersion", "Full")))]
 
-mu_table <- data.table(model=c("GLM", "GLMER", "TMB_no_shift", "TMB_full"))
+est[, `:=`(lower = mu - 1.96*se, upper = mu + 1.96*se)]
+est[, containMu := 2 > lower & 2 < upper]
 
-mu_table[, mu := c(fit1$coefficients, 
-                   tidy(fit2)$estimate[1], 
-                   Opt_no_shift$SD$value[2], 
-                   Opt$SD$value[3])]
+est[, .(mu_hat = mean(mu), coverageProb = mean(containMu)), model]
 
-mu_table[, sd := c(tidy(fit1)$std.error, 
-                   tidy(fit2)$std.error[1], 
-                   Opt_no_shift$SD$sd[2], 
-                   Opt$SD$sd[3])]
+hist <- ggplot(est, aes(mu)) + geom_density(aes(col=model, fill=model), alpha=0.5) + 
+  geom_vline(xintercept=2, linetype="dashed", col="red") + 
+  theme_bw() + ggtitle("Density of mu-hat")
 
-mtidy(fit1)
-tidy(fit2)
+#' Density of mu estimates by simulation
+pdf(file="hist.pdf", width=11, height=8.5)
+print(hist)
+dev.off()
 
-Obj$report()
+#' CI coverage of truth
+coverage <- ggplot(est, aes(nSim, mu)) + 
+  geom_point(size=1) +
+  geom_errorbar(aes(ymin=lower, ymax=upper, col=containMu)) + 
+  geom_hline(yintercept=2) + 
+  facet_wrap(~model) + 
+  theme_bw() + 
+  ggtitle("Coverage")
 
-Opt
-Opt_no_shift
+pdf(file="coverage.pdf", width=11, height=8.5)
+print(coverage)
+dev.off()
